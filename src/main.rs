@@ -1,7 +1,8 @@
 use clap::{Parser, clap_derive::ArgEnum};
+use csv::{StringRecord, StringRecordsIter};
 use hdrhistogram::{Histogram, serialization::{V2DeflateSerializer, Serializer}};
 use thiserror::Error;
-use std::{io, num::ParseIntError};
+use std::{io, num::ParseIntError, fs::File, collections::HashMap};
 
 #[derive(Error, Debug)]
 enum Error {
@@ -45,6 +46,12 @@ impl From<ParseIntError> for Error {
     }
 }
 
+impl From<String> for Error {
+    fn from(str: String) -> Self {
+        Error::UserError(str)
+    }
+}
+
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(ArgEnum, Debug, Clone)]
@@ -78,12 +85,11 @@ struct Args {
     oob: OOBRule,
 }
 
-fn some_or_err<T, FN>(maybe: Option<T>, err: FN) -> Result<T> 
-where FN: Fn() -> Error {
+fn some_or_missing_col<T>(maybe: Option<T>, col: &str) -> Result<T> {
     if let Some(v) = maybe {
         Result::Ok(v)
     } else {
-        Result::Err(err())
+        Result::Err(Error::UserError(format!("{} is not a valid column", col)))
     }
 }
 
@@ -94,16 +100,55 @@ fn serialize(hist: Histogram<u64>) -> String {
     base64::encode(buf)
 }
 
+struct JoinRHS<'a> {
+    reader: StringRecordsIter<'a, File>,
+    join_idx: usize,
+    ooo: HashMap<String, StringRecord>,
+}
+
+impl <'a> JoinRHS<'a> {
+    fn new(reader: StringRecordsIter<'a, File>, join_idx: usize) -> JoinRHS<'a> {
+        JoinRHS { reader: reader, join_idx, ooo: HashMap::new() }
+    }
+
+    fn take(&mut self, join_key: String) -> Result<Option<StringRecord>> {
+        if let Some(record) = self.ooo.remove(&join_key) {
+            Result::Ok(Option::Some(record))
+        } else {
+            while let Some(record) = self.reader.next() {
+                let record = record?;
+                if let Some(record_key) = record.get(self.join_idx) {
+                    if record_key == join_key {
+                        return Result::Ok(Option::Some(record))
+                    } else {
+                        self.ooo.insert(record_key.into(), record);
+                    }
+                }
+            }
+            Result::Ok(Option::None)
+        }
+    }
+}
+
 impl Args {
     fn to_hist(&self) -> Result<Histogram<u64>> {
+        if let Some(rhs_fname) = self.rhs_fname.as_ref() {
+            let join_cname = self.join_column.as_ref().ok_or(Error::UserError("join column not supplied".into()))?;
+            self.dual_file_to_hist(rhs_fname, join_cname)
+        } else {
+            self.single_file_to_hist()
+        }
+    }
+
+    fn single_file_to_hist(&self) -> Result<Histogram<u64>> {
         let mut hist : Histogram<u64> = Histogram::new_with_max(self.max_value, self.sigfigs)?;
         let mut csv = csv::Reader::from_path(&self.fname)?;
         let header = csv.headers()?;
         let lhs_idx = header.iter().position(|name| { name == &self.lhs_column});
         let rhs_idx = header.iter().position(|name| { name == &self.rhs_column});
 
-        let lhs_idx = some_or_err(lhs_idx, || {Error::UserError(format!("{} does not exist in {:?}", self.lhs_column, header))})?;
-        let rhs_idx = some_or_err(rhs_idx, || {Error::UserError(format!("{} does not exist in {:?}", self.rhs_column, header))})?;
+        let lhs_idx = some_or_missing_col(lhs_idx, &self.lhs_column)?;
+        let rhs_idx = some_or_missing_col(rhs_idx, &self.rhs_column)?;
 
         let records = csv.records();
         for record in records {
@@ -112,22 +157,90 @@ impl Args {
             let rhs = record.get(rhs_idx);
             if let Some(lhs) = lhs {
                 if let Some(rhs) = rhs {
-                    let lhs = lhs.parse::<u64>()?;
-                    let rhs = rhs.parse::<u64>()?;
+                    let lhs = lhs.parse::<i64>()?;
+                    let rhs = rhs.parse::<i64>()?;
+                    let v = lhs - rhs;
 
                     match self.oob {
                         OOBRule::Error => {
-                            hist.record(lhs - rhs).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
+                            hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
                         },
 
                         OOBRule::Saturate => {
-                            hist.saturating_record(lhs - rhs)
+                            hist.saturating_record(v as u64)
                         },
 
                         OOBRule::Drop => {
-                            let v = lhs - rhs;
-                            if v < self.max_value {
-                                hist.record(v).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
+                            if v >= 0 && v < self.max_value as i64 {
+                                hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
+                            }
+                        }
+                    }
+                    
+                }
+            }
+        }
+
+        Result::Ok(hist)
+    }
+
+    fn dual_file_to_hist(&self, rhs_fname: &String, join_column: &String) -> Result<Histogram<u64>> {
+        let mut hist : Histogram<u64> = Histogram::new_with_max(self.max_value, self.sigfigs)?;
+        let mut lhs_csv = csv::Reader::from_path(&self.fname)?;
+        let lhs_header = lhs_csv.headers()?;
+        let lhs_idx = lhs_header.iter().position(|name| { name == &self.lhs_column});
+        let lhs_join_idx = lhs_header.iter().position(|name| { name == join_column});
+
+        let mut rhs_csv = csv::Reader::from_path(&rhs_fname)?;
+        let rhs_header = rhs_csv.headers()?;
+        let rhs_idx = rhs_header.iter().position(|name| { name == &self.rhs_column});
+        let rhs_join_idx = rhs_header.iter().position(|name| { name == join_column});
+
+        let lhs_join_idx = some_or_missing_col(lhs_join_idx, &join_column)?;
+        let rhs_join_idx = some_or_missing_col(rhs_join_idx, &join_column)?;
+        let lhs_idx = some_or_missing_col(lhs_idx, &self.lhs_column)?;
+        let rhs_idx = some_or_missing_col(rhs_idx, &self.rhs_column)?;
+        let mut rhs_csv = JoinRHS::new(rhs_csv.records(), rhs_join_idx);
+
+        let lhs_records = lhs_csv.records();
+        for lhs_record in lhs_records {
+            let lhs_record = lhs_record?;
+            let lhs = lhs_record.get(lhs_idx);
+            let join_value = if let Some(value) = lhs_record.get(lhs_join_idx) {
+                value
+            } else {
+                continue
+            };
+
+            let rhs = if let Some(rhs_record) = rhs_csv.take(join_value.into())? {
+                rhs_record.get(rhs_idx).map(|v| { v.to_string() })
+            } else {
+                // rhs join record did not exist
+                Option::None
+            };
+
+            if let Some(lhs) = lhs {
+                if let Some(rhs) = rhs {
+                    let lhs = lhs.parse::<i64>()?;
+                    let rhs = rhs.parse::<i64>()?;
+                    let v = lhs - rhs;
+
+                    match self.oob {
+                        OOBRule::Error => {
+                            if v > 0 {
+                                hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
+                            }
+                        },
+
+                        OOBRule::Saturate => {
+                            if v > 0 {
+                                hist.saturating_record(v as u64)
+                            }
+                        },
+
+                        OOBRule::Drop => {
+                            if v >= 0 && v < self.max_value as i64 {
+                                hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
                             }
                         }
                     }
