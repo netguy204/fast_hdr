@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, clap_derive::ArgEnum};
 use hdrhistogram::{Histogram, serialization::{V2DeflateSerializer, Serializer}};
 use thiserror::Error;
 use std::{io, num::ParseIntError};
@@ -47,6 +47,13 @@ impl From<ParseIntError> for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+#[derive(ArgEnum, Debug, Clone)]
+enum OOBRule {
+    Error,
+    Drop,
+    Saturate
+}
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
@@ -66,6 +73,9 @@ struct Args {
     rhs_fname: Option<String>,
     #[clap(long, value_parser)]
     join_column: Option<String>,
+
+    #[clap(long, arg_enum, default_value_t = OOBRule::Error)]
+    oob: OOBRule,
 }
 
 fn some_or_err<T, FN>(maybe: Option<T>, err: FN) -> Result<T> 
@@ -105,7 +115,23 @@ impl Args {
                     let lhs = lhs.parse::<u64>()?;
                     let rhs = rhs.parse::<u64>()?;
 
-                    hist.record(lhs - rhs).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
+                    match self.oob {
+                        OOBRule::Error => {
+                            hist.record(lhs - rhs).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
+                        },
+
+                        OOBRule::Saturate => {
+                            hist.saturating_record(lhs - rhs)
+                        },
+
+                        OOBRule::Drop => {
+                            let v = lhs - rhs;
+                            if v < self.max_value {
+                                hist.record(v).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
+                            }
+                        }
+                    }
+                    
                 }
             }
         }
