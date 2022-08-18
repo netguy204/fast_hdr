@@ -1,11 +1,12 @@
 use clap::{Parser, clap_derive::ArgEnum};
-use csv::{StringRecord, StringRecordsIter};
+use csv::{StringRecord};
+use flate2::read::GzDecoder;
 use hdrhistogram::{Histogram, serialization::{V2DeflateSerializer, Serializer}};
 use thiserror::Error;
-use std::{io, num::ParseIntError, fs::File, collections::HashMap};
+use std::{io, num::ParseIntError, collections::HashMap, fs::File, ops::Deref};
 
 #[derive(Error, Debug)]
-enum Error {
+pub enum Error {
     #[error("io error {0}")]
     IO(io::Error),
 
@@ -85,14 +86,6 @@ struct Args {
     oob: OOBRule,
 }
 
-fn some_or_missing_col<T>(maybe: Option<T>, col: &str) -> Result<T> {
-    if let Some(v) = maybe {
-        Result::Ok(v)
-    } else {
-        Result::Err(Error::UserError(format!("{} is not a valid column", col)))
-    }
-}
-
 fn serialize(hist: Histogram<u64>) -> String {
     let mut ser = V2DeflateSerializer::new();
     let mut buf: Vec<u8> = Vec::new();
@@ -100,29 +93,167 @@ fn serialize(hist: Histogram<u64>) -> String {
     base64::encode(buf)
 }
 
-struct JoinRHS<'a> {
-    reader: StringRecordsIter<'a, File>,
-    join_idx: usize,
-    ooo: HashMap<String, StringRecord>,
+pub struct Measurement {
+    primary: u64,
+    rhs: Option<u64>,
+    join: Option<String>,
 }
 
-impl <'a> JoinRHS<'a> {
-    fn new(reader: StringRecordsIter<'a, File>, join_idx: usize) -> JoinRHS<'a> {
-        JoinRHS { reader: reader, join_idx, ooo: HashMap::new() }
+struct Reader<T>{
+    reader: csv::Reader<T>,
+    primary_idx: usize,
+    rhs_idx: Option<usize>,
+    join_idx: Option<usize>,
+}
+
+fn get_str(record: &StringRecord, idx: usize) -> Result<&str> {
+    record.get(idx).ok_or_else(|| {
+        Error::UserError(format!("{} is not a valid index in {:?}", idx, record))
+    })
+}
+
+fn get(record: &StringRecord, idx: usize) -> Result<u64> {
+    let value = get_str(record, idx);
+    let value = value.and_then(|value| {
+        value.parse::<u64>().map_err(|err| {err.into()})
+    });
+    value
+}
+
+type MeasurementIterator = dyn Iterator<Item = Result<Measurement>>;
+
+
+pub fn new_reader(fname: &str, primary_cname: &str, rhs_cname: Option<&str>, join_cname: Option<&str>) -> Result<Box<MeasurementIterator>> {
+    let result: Result<Box<dyn Iterator<Item = Result<Measurement>>>> = if fname.ends_with(".gz") {
+        new_compressed_reader(fname, primary_cname, rhs_cname, join_cname).map(|r| { Box::new(r) as Box<MeasurementIterator> })
+    } else {
+        new_uncompressed_reader(fname, primary_cname, rhs_cname, join_cname).map(|r| { Box::new(r) as Box<MeasurementIterator> })
+    };
+    result
+}
+
+fn new_uncompressed_reader(fname: &str, primary_cname: &str, rhs_cname: Option<&str>, join_cname: Option<&str>) -> Result<Reader<File>> {
+    let mut csv = csv::Reader::from_path(fname)?;
+    let header = csv.headers()?;
+    let primary_idx = header.iter().position(|name| { name == primary_cname});
+    let primary_idx = match primary_idx {
+        Option::None => {
+            return Result::Err(Error::UserError(format!("{} is not a column in {}", primary_cname, fname)));
+        },
+        Option::Some(value) => value,
+    };
+    let rhs_idx = rhs_cname.and_then(|rhs_cname| {
+        header.iter().position(|name| { name == rhs_cname})
+    });
+    let join_idx = join_cname.and_then(|join_cname| {
+        header.iter().position(|name| { name == join_cname })
+    });
+
+    Result::Ok(Reader {
+        reader: csv,
+        primary_idx,
+        rhs_idx,
+        join_idx,
+    })
+}
+
+fn new_compressed_reader(fname: &str, primary_cname: &str, rhs_cname: Option<&str>, join_cname: Option<&str>) -> Result<Reader<GzDecoder<File>>> {
+    let file = File::open(fname)?;
+    let file = GzDecoder::new(file);
+    let mut csv = csv::Reader::from_reader(file);
+    let header = csv.headers()?;
+    let primary_idx = header.iter().position(|name| { name == primary_cname});
+    let primary_idx = match primary_idx {
+        Option::None => {
+            return Result::Err(Error::UserError(format!("{} is not a column in {}", primary_cname, fname)));
+        },
+        Option::Some(value) => value,
+    };
+    let rhs_idx = rhs_cname.and_then(|rhs_cname| {
+        header.iter().position(|name| { name == rhs_cname})
+    });
+    let join_idx = join_cname.and_then(|join_cname| {
+        header.iter().position(|name| { name == join_cname })
+    });
+
+    Result::Ok(Reader {
+        reader: csv,
+        primary_idx,
+        rhs_idx,
+        join_idx,
+    })
+}
+
+
+impl <T: io::Read> Iterator for Reader<T> {
+    type Item = Result<Measurement>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let row = self.reader.records().next();
+        match row {
+            Option::Some(csv::Result::Err(err)) => {
+                return Option::Some(Result::Err(err.into()))
+            }
+            Option::Some(csv::Result::Ok(value)) => {
+                let lhs = get(&value, self.primary_idx);
+                let rhs = self.rhs_idx.map(|rhs_idx| { 
+                    get(&value, rhs_idx)
+                });
+                let join = self.join_idx.map(|join_idx| { 
+                    get_str(&value, join_idx)
+                });
+                // abort on required column read error
+                let rhs = match rhs {
+                    Option::None => Option::None,
+                    Option::Some(Result::Ok(v)) => Option::Some(v),
+                    Option::Some(Result::Err(err)) => {
+                        return Option::Some(Result::Err(err));
+                    }
+                };
+                let join = match join {
+                    Option::None => Option::None,
+                    Option::Some(Result::Ok(v)) => Option::Some(v),
+                    Option::Some(Result::Err(err)) => {
+                        return Option::Some(Result::Err(err));
+                    }
+                };
+
+                Option::Some(lhs.map(|lhs| {
+                    Measurement{
+                        primary: lhs,
+                        rhs: rhs,
+                        join: join.map(|join| { join.to_string() }),
+                    }
+                }))
+            }
+            Option::None => Option::None
+        }
+    }
+}
+
+
+
+struct JoinRHS {
+    reader: Box<MeasurementIterator>,
+    ooo: HashMap<String, Measurement>,
+}
+
+impl JoinRHS {
+    fn new(reader: Box<MeasurementIterator>) -> JoinRHS {
+        JoinRHS { reader, ooo: HashMap::new() }
     }
 
-    fn take(&mut self, join_key: String) -> Result<Option<StringRecord>> {
+    fn take(&mut self, join_key: String) -> Result<Option<Measurement>> {
         if let Some(record) = self.ooo.remove(&join_key) {
             Result::Ok(Option::Some(record))
         } else {
             while let Some(record) = self.reader.next() {
                 let record = record?;
-                if let Some(record_key) = record.get(self.join_idx) {
-                    if record_key == join_key {
-                        return Result::Ok(Option::Some(record))
-                    } else {
-                        self.ooo.insert(record_key.into(), record);
-                    }
+                let key = record.join.clone().unwrap();
+                if key == join_key {
+                    return Result::Ok(Option::Some(record))
+                } else {
+                    self.ooo.insert(key, record);
                 }
             }
             Result::Ok(Option::None)
@@ -132,9 +263,9 @@ impl <'a> JoinRHS<'a> {
 
 impl Args {
     fn to_hist(&self) -> Result<Histogram<u64>> {
-        if let Some(rhs_fname) = self.rhs_fname.as_ref() {
-            let join_cname = self.join_column.as_ref().ok_or(Error::UserError("join column not supplied".into()))?;
-            self.dual_file_to_hist(rhs_fname, join_cname)
+        if let Some(_) = self.rhs_fname.as_ref() {
+            self.join_column.as_ref().ok_or(Error::UserError("join column not supplied".into()))?;
+            self.dual_file_to_hist()
         } else {
             self.single_file_to_hist()
         }
@@ -142,109 +273,96 @@ impl Args {
 
     fn single_file_to_hist(&self) -> Result<Histogram<u64>> {
         let mut hist : Histogram<u64> = Histogram::new_with_max(self.max_value, self.sigfigs)?;
-        let mut csv = csv::Reader::from_path(&self.fname)?;
-        let header = csv.headers()?;
-        let lhs_idx = header.iter().position(|name| { name == &self.lhs_column});
-        let rhs_idx = header.iter().position(|name| { name == &self.rhs_column});
-
-        let lhs_idx = some_or_missing_col(lhs_idx, &self.lhs_column)?;
-        let rhs_idx = some_or_missing_col(rhs_idx, &self.rhs_column)?;
-
-        let records = csv.records();
+        let records = new_reader(
+            &self.fname,
+            &self.lhs_column,
+            Option::Some(&self.rhs_column),
+            Option::None,
+        )?;
         for record in records {
             let record = record?;
-            let lhs = record.get(lhs_idx);
-            let rhs = record.get(rhs_idx);
-            if let Some(lhs) = lhs {
-                if let Some(rhs) = rhs {
-                    let lhs = lhs.parse::<i64>()?;
-                    let rhs = rhs.parse::<i64>()?;
-                    let v = lhs - rhs;
+            let lhs = record.primary;
+            let rhs = record.rhs;
 
-                    match self.oob {
-                        OOBRule::Error => {
+            if let Some(rhs) = rhs {
+                let lhs = lhs as i64;
+                let rhs = rhs as i64;
+                let v = lhs - rhs;
+
+                match self.oob {
+                    OOBRule::Error => {
+                        hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
+                    },
+
+                    OOBRule::Saturate => {
+                        hist.saturating_record(v as u64)
+                    },
+
+                    OOBRule::Drop => {
+                        if v >= 0 && v < self.max_value as i64 {
                             hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
-                        },
-
-                        OOBRule::Saturate => {
-                            hist.saturating_record(v as u64)
-                        },
-
-                        OOBRule::Drop => {
-                            if v >= 0 && v < self.max_value as i64 {
-                                hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
-                            }
                         }
                     }
-                    
                 }
+                
             }
+
         }
 
         Result::Ok(hist)
     }
 
-    fn dual_file_to_hist(&self, rhs_fname: &String, join_column: &String) -> Result<Histogram<u64>> {
+    fn dual_file_to_hist(&self) -> Result<Histogram<u64>> {
         let mut hist : Histogram<u64> = Histogram::new_with_max(self.max_value, self.sigfigs)?;
-        let mut lhs_csv = csv::Reader::from_path(&self.fname)?;
-        let lhs_header = lhs_csv.headers()?;
-        let lhs_idx = lhs_header.iter().position(|name| { name == &self.lhs_column});
-        let lhs_join_idx = lhs_header.iter().position(|name| { name == join_column});
+        let lhs_records = new_reader(
+            &self.fname,
+            &self.lhs_column,
+            Option::None,
+            self.join_column.as_ref().map(|c| { c.deref() })
+        )?;
+        let rhs_records = new_reader(
+            &self.rhs_fname.as_ref().unwrap(),
+            &self.rhs_column,
+            Option::None,
+            self.join_column.as_ref().map(|c| { c.deref() })
+        )?;
+        let mut rhs_csv = JoinRHS::new(rhs_records);
 
-        let mut rhs_csv = csv::Reader::from_path(&rhs_fname)?;
-        let rhs_header = rhs_csv.headers()?;
-        let rhs_idx = rhs_header.iter().position(|name| { name == &self.rhs_column});
-        let rhs_join_idx = rhs_header.iter().position(|name| { name == join_column});
-
-        let lhs_join_idx = some_or_missing_col(lhs_join_idx, &join_column)?;
-        let rhs_join_idx = some_or_missing_col(rhs_join_idx, &join_column)?;
-        let lhs_idx = some_or_missing_col(lhs_idx, &self.lhs_column)?;
-        let rhs_idx = some_or_missing_col(rhs_idx, &self.rhs_column)?;
-        let mut rhs_csv = JoinRHS::new(rhs_csv.records(), rhs_join_idx);
-
-        let lhs_records = lhs_csv.records();
         for lhs_record in lhs_records {
             let lhs_record = lhs_record?;
-            let lhs = lhs_record.get(lhs_idx);
-            let join_value = if let Some(value) = lhs_record.get(lhs_join_idx) {
+            let lhs = lhs_record.primary;
+            let join_value = if let Some(value) = lhs_record.join {
                 value
             } else {
                 continue
             };
 
-            let rhs = if let Some(rhs_record) = rhs_csv.take(join_value.into())? {
-                rhs_record.get(rhs_idx).map(|v| { v.to_string() })
-            } else {
-                // rhs join record did not exist
-                Option::None
-            };
+            let rhs = rhs_csv.take(join_value.into())?;
+            let rhs = rhs.map(|rhs| { rhs.primary });
 
-            if let Some(lhs) = lhs {
-                if let Some(rhs) = rhs {
-                    let lhs = lhs.parse::<i64>()?;
-                    let rhs = rhs.parse::<i64>()?;
-                    let v = lhs - rhs;
+            if let Some(rhs) = rhs {
+                let lhs = lhs as i64;
+                let rhs = rhs as i64;
+                let v = lhs - rhs;
 
-                    match self.oob {
-                        OOBRule::Error => {
-                            if v > 0 {
-                                hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
-                            }
-                        },
+                match self.oob {
+                    OOBRule::Error => {
+                        if v > 0 {
+                            hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
+                        }
+                    },
 
-                        OOBRule::Saturate => {
-                            if v > 0 {
-                                hist.saturating_record(v as u64)
-                            }
-                        },
+                    OOBRule::Saturate => {
+                        if v > 0 {
+                            hist.saturating_record(v as u64)
+                        }
+                    },
 
-                        OOBRule::Drop => {
-                            if v >= 0 && v < self.max_value as i64 {
-                                hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
-                            }
+                    OOBRule::Drop => {
+                        if v >= 0 && v < self.max_value as i64 {
+                            hist.record(v as u64).map_err(|err| {Error::UserError(format!("could not record {}", err))})?;
                         }
                     }
-                    
                 }
             }
         }
